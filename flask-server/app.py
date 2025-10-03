@@ -7,6 +7,9 @@ import joblib
 from datetime import datetime, timedelta
 import hashlib
 import secrets
+import sqlite3
+import threading
+import time
 
 # Create a Flask web server instance.
 app = Flask(__name__)
@@ -307,6 +310,63 @@ def get_db_connection():
     conn.execute('PRAGMA busy_timeout=30000;')
     return conn
 
+# --- Dynamic threshold helpers (per project/material) ---
+def compute_project_threshold(cur, material_id: int, project_id: int, lookback_days: int = 30, safety_buffer_ratio: float = 0.10) -> float:
+    """Compute dynamic threshold = avgDaily(on days with entries) * (leadDays + 3) * (1 + buffer)."""
+    if not project_id:
+        return 0.0
+
+    try:
+        # Average of per-day totals over days that actually have usage entries
+        cur.execute(
+            """
+                SELECT AVG(daily_used) FROM (
+                    SELECT DATE(usage_date) as usage_day, SUM(CASE WHEN quantity_used > 0 THEN quantity_used ELSE 0 END) as daily_used
+                    FROM material_usage 
+                    WHERE material_id = ? AND project_id = ?
+                    GROUP BY DATE(usage_date)
+                )
+            """,
+            (material_id, project_id)
+        )
+        avg_daily = float(cur.fetchone()[0] or 0)
+
+        # Resolve lead time days from defaults
+        # Map material_id -> material name to look up defaults by name key
+        cur.execute("SELECT name FROM materials WHERE id = ?", (material_id,))
+        name_row = cur.fetchone()
+        material_name = str(name_row[0]).lower() if name_row and name_row[0] else ''
+        lead_days = int(MATERIAL_DEFAULTS.get(material_name, 90))
+
+        # Add 3-day safety in lead time as discussed, then multiply by 1 + buffer
+        effective_days = max(lead_days + 3, 0)
+        threshold = avg_daily * float(effective_days)
+        threshold *= (1.0 + float(safety_buffer_ratio))
+        return float(threshold)
+    except Exception:
+        return 0.0
+
+def compute_project_avg_daily(cur, material_id: int, project_id: int, lookback_days: int = 30) -> float:
+    """Compute average usage per entry (not per day): total_used / number_of_entries over full history."""
+    try:
+        if not project_id:
+            return 0.0
+        cur.execute(
+            """
+                SELECT COALESCE(SUM(CASE WHEN quantity_used > 0 THEN quantity_used ELSE 0 END), 0),
+                       COALESCE(COUNT(CASE WHEN quantity_used > 0 THEN 1 END), 0)
+                FROM material_usage
+                WHERE material_id = ? AND project_id = ?
+            """,
+            (material_id, project_id)
+        )
+        total_used, num_entries = cur.fetchone() or (0, 0)
+        total_used = float(total_used or 0)
+        num_entries = int(num_entries or 0)
+        return (total_used / num_entries) if num_entries > 0 else 0.0
+    except Exception:
+        return 0.0
+
 def init_periodic_db():
     conn = get_db_connection()
     cur = conn.cursor()
@@ -321,6 +381,7 @@ def init_periodic_db():
             salt TEXT NOT NULL,
             role TEXT NOT NULL CHECK (role IN ('admin', 'employee')),
             state TEXT,
+            admin_level TEXT, -- 'state' or 'central' when role is admin
             created_at TEXT NOT NULL,
             last_login TEXT
         )
@@ -334,6 +395,12 @@ def init_periodic_db():
     
     try:
         cur.execute("ALTER TABLE users ADD COLUMN state TEXT")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
+    # Add admin_level column for differentiating state vs central admin
+    try:
+        cur.execute("ALTER TABLE users ADD COLUMN admin_level TEXT")
     except sqlite3.OperationalError:
         pass  # Column already exists
     
@@ -512,6 +579,201 @@ def init_periodic_db():
             created_at TEXT NOT NULL
         )
     """)
+
+    # --- INVENTORY MANAGEMENT TABLES ---
+    
+    # Materials master table
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS materials (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            category TEXT NOT NULL,
+            unit TEXT NOT NULL,
+            unit_cost DECIMAL(10,2),
+            description TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+    # Suppliers table
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS suppliers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            contact_person TEXT,
+            email TEXT,
+            phone TEXT,
+            address TEXT,
+            lead_time_days INTEGER NOT NULL DEFAULT 7,
+            reliability_rating DECIMAL(3,2) DEFAULT 5.0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+    # Material suppliers relationship
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS material_suppliers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            material_id INTEGER NOT NULL,
+            supplier_id INTEGER NOT NULL,
+            supplier_unit_cost DECIMAL(10,2),
+            minimum_order_quantity DECIMAL(10,2),
+            is_primary BOOLEAN DEFAULT FALSE,
+            FOREIGN KEY(material_id) REFERENCES materials(id),
+            FOREIGN KEY(supplier_id) REFERENCES suppliers(id),
+            UNIQUE(material_id, supplier_id)
+        )
+    """)
+
+    # Current inventory levels
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS inventory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            material_id INTEGER NOT NULL UNIQUE,
+            current_stock DECIMAL(10,2) NOT NULL DEFAULT 0,
+            reserved_stock DECIMAL(10,2) NOT NULL DEFAULT 0,
+            reorder_point DECIMAL(10,2) NOT NULL DEFAULT 0,
+            max_stock DECIMAL(10,2) NOT NULL DEFAULT 1000,
+            location TEXT,
+            last_updated TEXT NOT NULL,
+            FOREIGN KEY(material_id) REFERENCES materials(id)
+        )
+    """)
+
+    # Material usage logs (consumption tracking)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS material_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            material_id INTEGER NOT NULL,
+            quantity_used DECIMAL(10,2) NOT NULL,
+            unit_cost DECIMAL(10,2),
+            total_cost DECIMAL(10,2),
+            usage_date TEXT NOT NULL,
+            logged_by INTEGER NOT NULL,
+            notes TEXT,
+            FOREIGN KEY(project_id) REFERENCES projects(id),
+            FOREIGN KEY(material_id) REFERENCES materials(id),
+            FOREIGN KEY(logged_by) REFERENCES users(id)
+        )
+    """)
+
+    # Delivery logs (incoming material tracking)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS material_deliveries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            material_id INTEGER NOT NULL,
+            project_id INTEGER,
+            supplier_id INTEGER,
+            quantity_delivered DECIMAL(10,2) NOT NULL,
+            unit_cost DECIMAL(10,2),
+            total_cost DECIMAL(10,2),
+            delivery_date TEXT NOT NULL,
+            received_by INTEGER NOT NULL,
+            purchase_order_number TEXT,
+            invoice_number TEXT,
+            quality_check_status TEXT DEFAULT 'pending',
+            notes TEXT,
+            FOREIGN KEY(material_id) REFERENCES materials(id),
+            FOREIGN KEY(project_id) REFERENCES projects(id),
+            FOREIGN KEY(supplier_id) REFERENCES suppliers(id),
+            FOREIGN KEY(received_by) REFERENCES users(id)
+        )
+    """)
+
+    # Add project_id column to material_deliveries if missing (migration)
+    try:
+        cur.execute("ALTER TABLE material_deliveries ADD COLUMN project_id INTEGER")
+    except sqlite3.OperationalError:
+        pass  # Column exists
+
+    # Reorder alerts table
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS reorder_alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            material_id INTEGER NOT NULL,
+            project_id INTEGER,
+            alert_type TEXT NOT NULL CHECK (alert_type IN ('low_stock', 'stockout', 'overstock')),
+            current_stock DECIMAL(10,2),
+            reorder_point DECIMAL(10,2),
+            suggested_order_quantity DECIMAL(10,2),
+            priority TEXT DEFAULT 'medium' CHECK (priority IN ('low', 'medium', 'high', 'critical')),
+            status TEXT DEFAULT 'active' CHECK (status IN ('active', 'acknowledged', 'resolved')),
+            created_at TEXT NOT NULL,
+            acknowledged_by INTEGER,
+            acknowledged_at TEXT,
+            resolved_at TEXT,
+            FOREIGN KEY(material_id) REFERENCES materials(id),
+            FOREIGN KEY(acknowledged_by) REFERENCES users(id),
+            FOREIGN KEY(project_id) REFERENCES projects(id)
+        )
+    """)
+
+    # Add project_id column to reorder_alerts if missing (migration)
+    try:
+        cur.execute("ALTER TABLE reorder_alerts ADD COLUMN project_id INTEGER")
+    except sqlite3.OperationalError:
+        pass  # Column exists
+
+    # Purchase orders table
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS purchase_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            supplier_id INTEGER NOT NULL,
+            order_number TEXT UNIQUE NOT NULL,
+            total_amount DECIMAL(12,2),
+            status TEXT DEFAULT 'draft' CHECK (status IN ('draft', 'sent', 'confirmed', 'partial_delivered', 'delivered', 'cancelled')),
+            order_date TEXT NOT NULL,
+            expected_delivery_date TEXT,
+            actual_delivery_date TEXT,
+            created_by INTEGER NOT NULL,
+            notes TEXT,
+            FOREIGN KEY(supplier_id) REFERENCES suppliers(id),
+            FOREIGN KEY(created_by) REFERENCES users(id)
+        )
+    """)
+
+    # Purchase order items
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS purchase_order_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            purchase_order_id INTEGER NOT NULL,
+            material_id INTEGER NOT NULL,
+            quantity DECIMAL(10,2) NOT NULL,
+            unit_cost DECIMAL(10,2) NOT NULL,
+            total_cost DECIMAL(10,2) NOT NULL,
+            delivered_quantity DECIMAL(10,2) DEFAULT 0,
+            FOREIGN KEY(purchase_order_id) REFERENCES purchase_orders(id),
+            FOREIGN KEY(material_id) REFERENCES materials(id)
+        )
+    """)
+
+    # Initialize default materials based on our forecasting models
+    current_time = datetime.now().isoformat()
+    try:
+        cur.execute("""
+            INSERT OR IGNORE INTO materials (name, category, unit, unit_cost, description, created_at, updated_at)
+            VALUES 
+            ('Steel', 'Structural', 'Tons', 850.0, 'Construction steel for towers and structures', ?, ?),
+            ('Conductor', 'Electrical', 'Meters', 12.50, 'Electrical conductors for power transmission', ?, ?),
+            ('Transformers', 'Electrical', 'Units', 25000.0, 'Power transformers for substations', ?, ?),
+            ('Earthwire', 'Electrical', 'Meters', 8.75, 'Grounding wire for electrical safety', ?, ?),
+            ('Foundation', 'Civil', 'Cubic Meters', 120.0, 'Concrete foundation materials', ?, ?),
+            ('Reactors', 'Electrical', 'Units', 15000.0, 'Electrical reactors for power systems', ?, ?),
+            ('Tower', 'Structural', 'Units', 5500.0, 'Pre-fabricated transmission towers', ?, ?)
+        """, (current_time, current_time, current_time, current_time, current_time, current_time, 
+              current_time, current_time, current_time, current_time, current_time, current_time,
+              current_time, current_time))
+
+        # Initialize inventory for default materials
+        cur.execute("""
+            INSERT OR IGNORE INTO inventory (material_id, current_stock, reorder_point, max_stock, location, last_updated)
+            SELECT id, 0.0, 0.0, 500.0, 'Main Warehouse', ? FROM materials
+        """, (current_time,))
+    except Exception as e:
+        print(f"Warning: Could not initialize default materials: {e}")
     
     conn.commit()
     conn.close()
@@ -549,6 +811,7 @@ def signup():
         username = data.get('username', '').strip()
         password = data.get('password', '')
         role = data.get('role', 'employee').lower()
+        admin_level = data.get('admin_level', '').lower()
         state = data.get('state', '').strip()
         
         # Validation
@@ -564,8 +827,19 @@ def signup():
         if role not in ['admin', 'employee']:
             return jsonify({"error": "Role must be either 'admin' or 'employee'."}), 400
         
-        if not state:
-            return jsonify({"error": "State is required."}), 400
+        # Validation rules:
+        # - employee: state required
+        # - admin + state: state required
+        # - admin + central: state must be empty
+        if role == 'employee' and not state:
+            return jsonify({"error": "State is required for employees."}), 400
+        if role == 'admin':
+            if admin_level not in ['state', 'central']:
+                return jsonify({"error": "Admin level must be 'state' or 'central'."}), 400
+            if admin_level == 'state' and not state:
+                return jsonify({"error": "State is required for state admins."}), 400
+            if admin_level == 'central' and state:
+                return jsonify({"error": "Central admins should not select a state."}), 400
         
         # Check if user already exists
         existing_user = get_user_by_username(username)
@@ -579,8 +853,8 @@ def signup():
         conn = get_db_connection()
         try:
             conn.execute(
-                'INSERT INTO users (fullname, username, password_hash, salt, role, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
-                (fullname or username, username, password_hash, salt, role, state, datetime.now().isoformat())
+                'INSERT INTO users (fullname, username, password_hash, salt, role, state, admin_level, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                (fullname or username, username, password_hash, salt, role, state if role != 'admin' or admin_level == 'state' else None, admin_level if role == 'admin' else None, datetime.now().isoformat())
             )
             conn.commit()
             
@@ -641,6 +915,7 @@ def login():
                 "username": user['username'],
                 "role": user['role'],
                 "state": user['state'] if user['state'] else '',  # Fallback to empty string if state is NULL
+                "admin_level": user['admin_level'] if 'admin_level' in user.keys() else None,
                 "created_at": user['created_at'],
                 "last_login": datetime.now().isoformat()
             }
@@ -676,6 +951,10 @@ def create_project():
         
         # Set status based on role
         status = "approved" if created_by_role == "admin" else "pending"
+        # Central admin cannot create projects
+        creator_user = get_user_by_id(created_by_user_id)
+        if creator_user and creator_user['role'] == 'admin' and (creator_user['admin_level'] or '').lower() == 'central':
+            return jsonify({"error": "Central admins cannot create projects."}), 403
         
         # Get forecasts from prediction API
         prediction_data = {
@@ -729,6 +1008,52 @@ def create_project():
         ))
         
         project_id = cur.lastrowid
+        
+        # AUTO-RESERVE MATERIALS based on forecast
+        try:
+            # Get material IDs for forecasted materials
+            material_mapping = {
+                'steel': 'Steel',
+                'conductor': 'Conductor', 
+                'transformers': 'Transformers',
+                'earthwire': 'Earthwire',
+                'foundation': 'Foundation',
+                'reactors': 'Reactors',
+                'tower': 'Tower'
+            }
+            
+            for forecast_key, material_name in material_mapping.items():
+                forecast_value = forecasts.get(forecast_key, 0)
+                if forecast_value > 0:
+                    # Get material ID
+                    cur.execute('SELECT id FROM materials WHERE name = ?', (material_name,))
+                    material_row = cur.fetchone()
+                    
+                    if material_row:
+                        material_id = material_row[0]
+                        
+                        # Update reserved stock in inventory
+                        cur.execute("""
+                            UPDATE inventory 
+                            SET reserved_stock = reserved_stock + ?,
+                                last_updated = ?
+                            WHERE material_id = ?
+                        """, (forecast_value, datetime.now().isoformat(), material_id))
+                        
+                        # Log the reservation in material_usage with negative quantity to indicate reservation
+                        cur.execute("""
+                            INSERT INTO material_usage 
+                            (project_id, material_id, quantity_used, unit_cost, total_cost, usage_date, logged_by, notes)
+                            VALUES (?, ?, ?, 0, 0, ?, ?, ?)
+                        """, (project_id, material_id, -forecast_value, datetime.now().isoformat(), 
+                              created_by_user_id, f'Auto-reserved based on AI forecast for project creation'))
+                        
+                        print(f"Reserved {forecast_value} units of {material_name} for project {project_id}")
+        
+        except Exception as e:
+            print(f"Warning: Failed to auto-reserve materials: {e}")
+            # Continue without failing the project creation
+        
         conn.commit()
         conn.close()
         
@@ -755,13 +1080,21 @@ def get_user_projects(user_id):
         cur = conn.cursor()
         
         if user['role'] == 'admin':
-            # Admin sees all projects from their state
-            # First get the user's state based on a project they created (if any)
-            # For now, we'll get all projects and filter by state in the response
-            cur.execute("""
-                SELECT * FROM projects 
-                ORDER BY created_at DESC
-            """)
+            # If central admin: can only approve/decline (see frontend), show all pending projects
+            if (user['admin_level'] or '').lower() == 'central':
+                cur.execute("""
+                    SELECT * FROM projects 
+                    WHERE status IN ('pending','approved','declined','finished','deleted')
+                    ORDER BY created_at DESC
+                """)
+            else:
+                # Admin sees all projects from their state
+                # First get the user's state based on a project they created (if any)
+                # For now, we'll get all projects and filter by state in the response
+                cur.execute("""
+                    SELECT * FROM projects 
+                    ORDER BY created_at DESC
+                """)
         else:
             # Employee sees only their own projects
             cur.execute("""
@@ -1570,9 +1903,711 @@ def delete_project(project_id):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+# --- INVENTORY MANAGEMENT ENDPOINTS ---
+
+@app.route('/inventory/materials', methods=['GET'])
+def get_materials():
+    """Get all materials with current inventory levels"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # Optional project filter for delivery_count
+        project_id_filter = request.args.get('project_id', type=int)
+        if project_id_filter:
+            cur.execute("""
+                SELECT 
+                    m.id, m.name, m.category, m.unit, m.unit_cost, m.description,
+                    i.current_stock, i.reserved_stock, 
+                    (i.current_stock - i.reserved_stock) as available_stock,
+                    i.reorder_point, i.max_stock, i.location, i.last_updated,
+                    COALESCE((SELECT COUNT(1) FROM material_deliveries d WHERE d.material_id = m.id AND d.project_id = ?), 0) as delivery_count,
+                    COALESCE((SELECT SUM(d.quantity_delivered) FROM material_deliveries d WHERE d.material_id = m.id AND d.project_id = ?), 0) as project_delivered,
+                    COALESCE((SELECT SUM(mu.quantity_used) FROM material_usage mu WHERE mu.material_id = m.id AND mu.project_id = ?), 0) as project_used
+                FROM materials m
+                LEFT JOIN inventory i ON m.id = i.material_id
+                ORDER BY m.category, m.name
+            """, (project_id_filter, project_id_filter, project_id_filter))
+        else:
+            cur.execute("""
+                SELECT 
+                    m.id, m.name, m.category, m.unit, m.unit_cost, m.description,
+                    i.current_stock, i.reserved_stock, 
+                    (i.current_stock - i.reserved_stock) as available_stock,
+                    i.reorder_point, i.max_stock, i.location, i.last_updated,
+                    COALESCE((SELECT COUNT(1) FROM material_deliveries d WHERE d.material_id = m.id), 0) as delivery_count
+                FROM materials m
+                LEFT JOIN inventory i ON m.id = i.material_id
+                ORDER BY m.category, m.name
+            """)
+        
+        materials = []
+        for row in cur.fetchall():
+            materials.append({
+                'id': row[0],
+                'name': row[1],
+                'category': row[2],
+                'unit': row[3],
+                'unit_cost': row[4],
+                'description': row[5],
+                'current_stock': row[6] or 0,
+                'reserved_stock': row[7] or 0,
+                'available_stock': row[8] or 0,
+                'reorder_point': row[9] or 0,
+                'max_stock': row[10] or 1000,
+                'location': row[11] or 'Unknown',
+                'last_updated': row[12],
+                'delivery_count': row[13],
+                'project_delivered': row[14] if len(row) > 14 else None,
+                'project_used': row[15] if len(row) > 15 else None
+            })
+        
+        conn.close()
+        return jsonify(materials)
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/inventory/usage', methods=['POST'])
+def log_material_usage():
+    """Log material usage for a project"""
+    try:
+        data = request.get_json()
+        project_id = data.get('project_id')
+        material_id = data.get('material_id')
+        quantity_used = data.get('quantity_used')
+        logged_by = data.get('logged_by')
+        notes = data.get('notes', '')
+        
+        if not all([project_id, material_id, quantity_used, logged_by]):
+            return jsonify({'error': 'Missing required fields'}), 400
+        
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # Get material unit cost
+        cur.execute('SELECT unit_cost FROM materials WHERE id = ?', (material_id,))
+        material = cur.fetchone()
+        if not material:
+            return jsonify({'error': 'Material not found'}), 404
+        
+        unit_cost = material[0] or 0
+        total_cost = float(quantity_used) * float(unit_cost)
+        
+        # Log the usage
+        cur.execute("""
+            INSERT INTO material_usage 
+            (project_id, material_id, quantity_used, unit_cost, total_cost, usage_date, logged_by, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (project_id, material_id, quantity_used, unit_cost, total_cost, 
+              datetime.now().isoformat(), logged_by, notes))
+
+        # If no deliveries yet for this material, keep current_stock at zero
+        cur.execute("SELECT COUNT(1) FROM material_deliveries WHERE material_id = ?", (material_id,))
+        deliveries_before_usage_row = cur.fetchone()
+        deliveries_before_usage = deliveries_before_usage_row[0] if deliveries_before_usage_row else 0
+
+        if deliveries_before_usage > 0:
+            # Update inventory only if at least one delivery has happened
+            cur.execute("""
+                UPDATE inventory 
+                SET current_stock = current_stock - ?,
+                    last_updated = ?
+                WHERE material_id = ?
+            """, (quantity_used, datetime.now().isoformat(), material_id))
+        
+        conn.commit()
+        
+        # After logging usage, compute dynamic threshold and create alert only if needed
+        # Has at least one delivery (first stocking)?
+        cur.execute("""
+            SELECT COUNT(1) FROM material_deliveries WHERE material_id = ? AND project_id = ?
+        """, (material_id, project_id))
+        deliveries_count_row = cur.fetchone()
+        deliveries_count = deliveries_count_row[0] if deliveries_count_row else 0
+
+        if deliveries_count > 0:
+            # Compute per-project current stock = deliveries - usage for this project
+            cur.execute("""
+                SELECT COALESCE(SUM(quantity_delivered),0) FROM material_deliveries 
+                WHERE material_id = ? AND project_id = ?
+            """, (material_id, project_id))
+            delivered_sum = cur.fetchone()[0] or 0
+            cur.execute("""
+                SELECT COALESCE(SUM(quantity_used),0) FROM material_usage 
+                WHERE material_id = ? AND project_id = ?
+            """, (material_id, project_id))
+            used_sum = cur.fetchone()[0] or 0
+            project_current_stock = float(delivered_sum) - float(used_sum)
+
+            # Dynamic threshold based on last 30 days and 10% buffer
+            threshold = compute_project_threshold(cur, int(material_id), int(project_id), lookback_days=30, safety_buffer_ratio=0.10)
+
+            if project_current_stock < threshold and threshold > 0:
+                # Suggested order should suffice next lead-time days (not the threshold window)
+                name_key = ''
+                try:
+                    cur.execute("SELECT name FROM materials WHERE id = ?", (material_id,))
+                    nrow = cur.fetchone()
+                    name_key = str(nrow[0]).lower() if nrow and nrow[0] else ''
+                except Exception:
+                    name_key = ''
+                lead_days = int(MATERIAL_DEFAULTS.get(name_key, 90))
+                buffer_days = 4
+                avg_daily = compute_project_avg_daily(cur, int(material_id), int(project_id), lookback_days=30)
+                target_for_lead = float(avg_daily) * float(max(lead_days + buffer_days, 0))
+                suggested_qty = max(target_for_lead, 0)
+
+                # Create or update alert with dynamic threshold and lead-days suggestion
+                cur.execute("""
+                    INSERT OR REPLACE INTO reorder_alerts 
+                    (id, material_id, project_id, alert_type, current_stock, reorder_point, 
+                     suggested_order_quantity, priority, status, created_at)
+                    VALUES (
+                        (
+                            SELECT id FROM reorder_alerts 
+                            WHERE material_id = ? AND project_id = ? AND status = 'active'
+                            LIMIT 1
+                        ),
+                        ?, ?, ?, ?, ?, ?, ?, 'active', ?
+                    )
+                """, (
+                    material_id, project_id,
+                    material_id, project_id, 'low_stock', project_current_stock, threshold,
+                    suggested_qty,
+                    'high' if project_current_stock <= 0 else 'medium',
+                    datetime.now().isoformat()
+                ))
+                conn.commit()
+            # Email notifications removed per requirement
+        
+        conn.close()
+        
+        return jsonify({
+            'message': 'Material usage logged successfully',
+            'usage_id': cur.lastrowid,
+            'total_cost': total_cost
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/inventory/delivery', methods=['POST'])
+def log_material_delivery():
+    """Log material delivery/receipt"""
+    try:
+        data = request.get_json()
+        material_id = data.get('material_id')
+        project_id = data.get('project_id')
+        quantity_delivered = data.get('quantity_delivered')
+        received_by = data.get('received_by')
+        supplier_id = data.get('supplier_id')
+        unit_cost = data.get('unit_cost')
+        purchase_order_number = data.get('purchase_order_number', '')
+        invoice_number = data.get('invoice_number', '')
+        notes = data.get('notes', '')
+        
+        if not all([material_id, quantity_delivered, received_by]):
+            return jsonify({'error': 'Missing required fields'}), 400
+        
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # Get material default cost if not provided
+        if not unit_cost:
+            cur.execute('SELECT unit_cost FROM materials WHERE id = ?', (material_id,))
+            material = cur.fetchone()
+            unit_cost = material[0] if material else 0
+        
+        total_cost = float(quantity_delivered) * float(unit_cost)
+        
+        # Log the delivery
+        cur.execute("""
+            INSERT INTO material_deliveries 
+            (material_id, project_id, supplier_id, quantity_delivered, unit_cost, total_cost, 
+             delivery_date, received_by, purchase_order_number, invoice_number, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (material_id, project_id, supplier_id, quantity_delivered, unit_cost, total_cost,
+              datetime.now().isoformat(), received_by, purchase_order_number, 
+              invoice_number, notes))
+        
+        # Update inventory
+        cur.execute("""
+            UPDATE inventory 
+            SET current_stock = current_stock + ?,
+                last_updated = ?
+            WHERE material_id = ?
+        """, (quantity_delivered, datetime.now().isoformat(), material_id))
+        
+        # If no inventory record exists, create one
+        if cur.rowcount == 0:
+            cur.execute("""
+                INSERT INTO inventory (material_id, current_stock, reorder_point, max_stock, location, last_updated)
+                VALUES (?, ?, 0.0, 500.0, 'Main Warehouse', ?)
+            """, (material_id, quantity_delivered, datetime.now().isoformat()))
+        
+        conn.commit()
+        conn.close()
+        
+        return jsonify({
+            'message': 'Material delivery logged successfully',
+            'delivery_id': cur.lastrowid,
+            'total_cost': total_cost
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/inventory/alerts', methods=['GET'])
+def get_reorder_alerts():
+    """Get all active reorder alerts"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        # Optional project_id filter
+        project_id = request.args.get('project_id', type=int)
+        if project_id:
+            cur.execute("""
+                SELECT 
+                    ra.id, ra.alert_type, ra.current_stock, ra.reorder_point,
+                    ra.suggested_order_quantity, ra.priority, ra.created_at,
+                    m.name, m.unit, m.category, m.unit_cost, ra.project_id
+                FROM reorder_alerts ra
+                JOIN materials m ON ra.material_id = m.id
+                WHERE ra.status = 'active' AND ra.project_id = ?
+                ORDER BY 
+                    CASE ra.priority 
+                        WHEN 'critical' THEN 1 
+                        WHEN 'high' THEN 2 
+                        WHEN 'medium' THEN 3 
+                        ELSE 4 
+                    END,
+                    ra.created_at DESC
+            """, (project_id,))
+        else:
+            cur.execute("""
+                SELECT 
+                    ra.id, ra.alert_type, ra.current_stock, ra.reorder_point,
+                    ra.suggested_order_quantity, ra.priority, ra.created_at,
+                    m.name, m.unit, m.category, m.unit_cost, ra.project_id
+                FROM reorder_alerts ra
+                JOIN materials m ON ra.material_id = m.id
+                WHERE ra.status = 'active'
+                ORDER BY 
+                    CASE ra.priority 
+                        WHEN 'critical' THEN 1 
+                        WHEN 'high' THEN 2 
+                        WHEN 'medium' THEN 3 
+                        ELSE 4 
+                    END,
+                    ra.created_at DESC
+            """)
+        
+        base_rows = cur.fetchall()
+
+        alerts = []
+        for row in base_rows:
+            alert = {
+                'id': row[0],
+                'alert_type': row[1],
+                'current_stock': row[2],
+                'reorder_point': row[3],
+                'suggested_order_quantity': row[4],
+                'priority': row[5],
+                'created_at': row[6],
+                'material_name': row[7],
+                'unit': row[8],
+                'category': row[9],
+                'unit_cost': row[10],
+                'project_id': row[11]
+            }
+
+            # Recompute suggested order using coverage = lead time days (+4 buffer) only
+            if alert['project_id']:
+                # Look up material_id via alert id
+                cur.execute("SELECT material_id FROM reorder_alerts WHERE id = ?", (alert['id'],))
+                row_mid = cur.fetchone()
+                if row_mid:
+                    material_id = int(row_mid[0])
+                    avg_daily = compute_project_avg_daily(cur, material_id, int(alert['project_id']), lookback_days=30)
+                    name_key = str(alert['material_name']).lower() if alert['material_name'] else ''
+                    cov_days = int(MATERIAL_DEFAULTS.get(name_key, 90))
+                    buffer_days = 4
+                    target_qty = float(avg_daily) * float(max(cov_days + buffer_days, 0))
+                    recomputed = max(target_qty, 0)
+                    alert['suggested_order_quantity'] = recomputed
+            alerts.append(alert)
+        
+        conn.close()
+        return jsonify(alerts)
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/inventory/alerts/<alert_id>/acknowledge', methods=['PUT'])
+def acknowledge_alert(alert_id):
+    """Acknowledge a reorder alert"""
+    try:
+        data = request.get_json()
+        acknowledged_by = data.get('acknowledged_by')
+        
+        if not acknowledged_by:
+            return jsonify({'error': 'acknowledged_by is required'}), 400
+        
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        cur.execute("""
+            UPDATE reorder_alerts 
+            SET status = 'acknowledged',
+                acknowledged_by = ?,
+                acknowledged_at = ?
+            WHERE id = ?
+        """, (acknowledged_by, datetime.now().isoformat(), alert_id))
+        
+        conn.commit()
+        conn.close()
+        
+        return jsonify({'message': 'Alert acknowledged successfully'})
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/inventory/dashboard', methods=['GET'])
+def get_inventory_dashboard():
+    """Get inventory dashboard data"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # Get inventory summary
+        cur.execute("""
+            SELECT 
+                COUNT(*) as total_materials,
+                SUM(CASE WHEN i.current_stock <= i.reorder_point THEN 1 ELSE 0 END) as low_stock_count,
+                SUM(CASE WHEN i.current_stock <= 0 THEN 1 ELSE 0 END) as stockout_count,
+                SUM(i.current_stock * m.unit_cost) as total_inventory_value
+            FROM materials m
+            LEFT JOIN inventory i ON m.id = i.material_id
+        """)
+        summary = cur.fetchone()
+        
+        # Get recent usage
+        cur.execute("""
+            SELECT 
+                mu.usage_date, mu.quantity_used, mu.total_cost,
+                m.name, m.unit, p.location
+            FROM material_usage mu
+            JOIN materials m ON mu.material_id = m.id
+            JOIN projects p ON mu.project_id = p.id
+            ORDER BY mu.usage_date DESC
+            LIMIT 10
+        """)
+        recent_usage = cur.fetchall()
+        
+        # Get recent deliveries
+        cur.execute("""
+            SELECT 
+                md.delivery_date, md.quantity_delivered, md.total_cost,
+                m.name, m.unit, s.name as supplier_name
+            FROM material_deliveries md
+            JOIN materials m ON md.material_id = m.id
+            LEFT JOIN suppliers s ON md.supplier_id = s.id
+            ORDER BY md.delivery_date DESC
+            LIMIT 10
+        """)
+        recent_deliveries = cur.fetchall()
+        
+        # Get top consuming materials (last 30 days)
+        thirty_days_ago = (datetime.now() - timedelta(days=30)).isoformat()
+        cur.execute("""
+            SELECT 
+                m.name, m.unit, SUM(mu.quantity_used) as total_used,
+                SUM(mu.total_cost) as total_cost
+            FROM material_usage mu
+            JOIN materials m ON mu.material_id = m.id
+            WHERE mu.usage_date >= ?
+            GROUP BY m.id, m.name, m.unit
+            ORDER BY total_used DESC
+            LIMIT 5
+        """, (thirty_days_ago,))
+        top_consuming = cur.fetchall()
+        
+        conn.close()
+        
+        return jsonify({
+            'summary': {
+                'total_materials': summary[0] or 0,
+                'low_stock_count': summary[1] or 0,
+                'stockout_count': summary[2] or 0,
+                'total_inventory_value': summary[3] or 0
+            },
+            'recent_usage': [
+                {
+                    'date': row[0],
+                    'quantity': row[1],
+                    'cost': row[2],
+                    'material': row[3],
+                    'unit': row[4],
+                    'project_location': row[5]
+                }
+                for row in recent_usage
+            ],
+            'recent_deliveries': [
+                {
+                    'date': row[0],
+                    'quantity': row[1],
+                    'cost': row[2],
+                    'material': row[3],
+                    'unit': row[4],
+                    'supplier': row[5] or 'Unknown'
+                }
+                for row in recent_deliveries
+            ],
+            'top_consuming': [
+                {
+                    'material': row[0],
+                    'unit': row[1],
+                    'total_used': row[2],
+                    'total_cost': row[3]
+                }
+                for row in top_consuming
+            ]
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/inventory/project-usage/<project_id>', methods=['GET'])
+def get_project_material_usage(project_id):
+    """Get material usage for a specific project"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        cur.execute("""
+            SELECT 
+                mu.id, mu.quantity_used, mu.unit_cost, mu.total_cost, 
+                mu.usage_date, mu.notes,
+                m.name, m.unit, m.category,
+                u.fullname as logged_by_name
+            FROM material_usage mu
+            JOIN materials m ON mu.material_id = m.id
+            JOIN users u ON mu.logged_by = u.id
+            WHERE mu.project_id = ?
+            ORDER BY mu.usage_date DESC
+        """, (project_id,))
+        
+        usage_records = []
+        for row in cur.fetchall():
+            usage_records.append({
+                'id': row[0],
+                'quantity_used': row[1],
+                'unit_cost': row[2],
+                'total_cost': row[3],
+                'usage_date': row[4],
+                'notes': row[5],
+                'material_name': row[6],
+                'unit': row[7],
+                'category': row[8],
+                'logged_by': row[9]
+            })
+        
+        conn.close()
+        return jsonify(usage_records)
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# --- BACKGROUND TASKS FOR INVENTORY MONITORING ---
+
+def calculate_reorder_points():
+    """Calculate dynamic reorder points based on usage patterns"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # Get all materials
+        cur.execute('SELECT id FROM materials')
+        materials = cur.fetchall()
+        
+        for material in materials:
+            material_id = material[0]
+            
+            # Calculate average daily usage (last 30 days)
+            thirty_days_ago = (datetime.now() - timedelta(days=30)).isoformat()
+            cur.execute("""
+                SELECT AVG(daily_usage) FROM (
+                    SELECT DATE(usage_date) as usage_day, SUM(quantity_used) as daily_usage
+                    FROM material_usage 
+                    WHERE material_id = ? AND usage_date >= ?
+                    GROUP BY DATE(usage_date)
+                )
+            """, (material_id, thirty_days_ago))
+            
+            result = cur.fetchone()
+            avg_daily_usage = result[0] if result[0] else 0
+            
+            if avg_daily_usage > 0:
+                # Get primary supplier lead time
+                cur.execute("""
+                    SELECT s.lead_time_days FROM suppliers s
+                    JOIN material_suppliers ms ON s.id = ms.supplier_id
+                    WHERE ms.material_id = ? AND ms.is_primary = 1
+                    LIMIT 1
+                """, (material_id,))
+                
+                supplier = cur.fetchone()
+                lead_time = supplier[0] if supplier else 7  # Default 7 days
+                
+                # Calculate reorder point: (avg_daily_usage * lead_time) + safety_stock
+                safety_stock = avg_daily_usage * 3  # 3 days safety stock
+                new_reorder_point = (avg_daily_usage * lead_time) + safety_stock
+                
+                # Update reorder point
+                cur.execute("""
+                    UPDATE inventory 
+                    SET reorder_point = ?, last_updated = ?
+                    WHERE material_id = ?
+                """, (new_reorder_point, datetime.now().isoformat(), material_id))
+        
+        conn.commit()
+        conn.close()
+        print(f"Reorder points recalculated at {datetime.now()}")
+        
+    except Exception as e:
+        print(f"Error calculating reorder points: {e}")
+
+def check_inventory_alerts():
+    """Check for low stock and create alerts using dynamic per-project threshold"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # Iterate materials and projects; evaluate dynamic thresholds and upsert alerts
+        cur.execute("SELECT id, name FROM materials")
+        materials = cur.fetchall()
+        sixty_days_ago = (datetime.now() - timedelta(days=60)).isoformat()
+
+        for m in materials:
+            material_id = m['id'] if isinstance(m, sqlite3.Row) else m[0]
+            material_name = m['name'] if isinstance(m, sqlite3.Row) else m[1]
+
+            # Projects that have any usage or deliveries for this material
+            cur.execute(
+                """
+                    SELECT DISTINCT p.id
+                    FROM projects p
+                    LEFT JOIN material_deliveries md ON md.project_id = p.id AND md.material_id = ?
+                    LEFT JOIN material_usage mu ON mu.project_id = p.id AND mu.material_id = ?
+                    WHERE md.id IS NOT NULL OR mu.id IS NOT NULL
+                """,
+                (material_id, material_id)
+            )
+            project_rows = cur.fetchall()
+
+            for pr in project_rows:
+                project_id = pr['id'] if isinstance(pr, sqlite3.Row) else pr[0]
+
+                # Require at least one delivery for this project/material
+                cur.execute("SELECT COUNT(1) FROM material_deliveries WHERE material_id = ? AND project_id = ?", (material_id, project_id))
+                deliveries_count = cur.fetchone()[0] or 0
+                if deliveries_count == 0:
+                    continue
+
+                # Project current stock = deliveries - usage
+                cur.execute("SELECT COALESCE(SUM(quantity_delivered),0) FROM material_deliveries WHERE material_id = ? AND project_id = ?", (material_id, project_id))
+                delivered_sum = cur.fetchone()[0] or 0
+                cur.execute("SELECT COALESCE(SUM(quantity_used),0) FROM material_usage WHERE material_id = ? AND project_id = ?", (material_id, project_id))
+                used_sum = cur.fetchone()[0] or 0
+                project_current_stock = float(delivered_sum) - float(used_sum)
+
+                # Require recent usage activity (last 60 days) or any reservations
+                cur.execute("""
+                    SELECT COUNT(1) FROM material_usage 
+                    WHERE material_id = ? AND project_id = ? AND usage_date >= ? AND quantity_used > 0
+                """, (material_id, project_id, sixty_days_ago))
+                recent_usage_count = cur.fetchone()[0] or 0
+                if recent_usage_count == 0:
+                    cur.execute("SELECT reserved_stock FROM inventory WHERE material_id = ?", (material_id,))
+                    rr = cur.fetchone()
+                    reserved_stock = rr[0] if rr and rr[0] is not None else 0
+                    if reserved_stock <= 0:
+                        continue
+
+                # Dynamic threshold per project/material
+                threshold = compute_project_threshold(cur, int(material_id), int(project_id), lookback_days=30, safety_buffer_ratio=0.10)
+                if threshold <= 0:
+                    continue
+
+                if project_current_stock < threshold:
+                    alert_type = 'stockout' if project_current_stock <= 0 else 'low_stock'
+                    priority = 'critical' if project_current_stock <= 0 else 'high'
+
+                    # Suggest enough to cover next lead-time days
+                    cur.execute("SELECT name FROM materials WHERE id = ?", (material_id,))
+                    nrow = cur.fetchone()
+                    name_key = str(nrow[0]).lower() if nrow and nrow[0] else ''
+                    lead_days = int(MATERIAL_DEFAULTS.get(name_key, 75))
+                    buffer_days = 4
+                    avg_daily = compute_project_avg_daily(cur, int(material_id), int(project_id), lookback_days=30)
+                    target_for_lead = float(avg_daily) * float(max(lead_days + buffer_days, 0))
+                    suggested_qty = max(target_for_lead, 0)
+
+                    cur.execute(
+                        """
+                            INSERT OR REPLACE INTO reorder_alerts 
+                            (id, material_id, project_id, alert_type, current_stock, reorder_point,
+                             suggested_order_quantity, priority, status, created_at)
+                            VALUES (
+                                (
+                                    SELECT id FROM reorder_alerts 
+                                    WHERE material_id = ? AND project_id = ? AND status = 'active'
+                                    LIMIT 1
+                                ),
+                                ?, ?, ?, ?, ?, ?, ?, 'active', ?
+                            )
+                        """,
+                        (
+                            material_id, project_id,
+                            material_id, project_id, alert_type, project_current_stock, threshold,
+                            suggested_qty,
+                            priority,
+                            datetime.now().isoformat()
+                        )
+                    )
+        
+        conn.commit()
+        conn.close()
+        
+    except Exception as e:
+        print(f"Error checking inventory alerts: {e}")
+
+def inventory_monitoring_task():
+    """Background task for inventory monitoring"""
+    while True:
+        try:
+            # Run every hour
+            time.sleep(3600)
+            calculate_reorder_points()
+            check_inventory_alerts()
+        except Exception as e:
+            print(f"Error in inventory monitoring task: {e}")
+            time.sleep(300)  # Wait 5 minutes before retrying
+
+# Start inventory monitoring in background
+def start_inventory_monitoring():
+    monitoring_thread = threading.Thread(target=inventory_monitoring_task, daemon=True)
+    monitoring_thread.start()
+    print("Inventory monitoring started")
+
 if __name__ == "__main__":
     init_periodic_db()
     if LOADED_MODELS:
+        start_inventory_monitoring()
         app.run(debug=True, host="0.0.0.0", port=5002)
     else:
         print("Application startup failed due to model loading error.")
+
+# Email notification code removed per requirement

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import Map from './Map'; // This line is still needed
 import Dashboard from './Dashboard';
 import AdminDashboard from './AdminDashboard';
@@ -7,7 +7,7 @@ function App() {
   // States
   const [userData, setUserData] = useState({});
   const [projects, setProjects] = useState([]);
-  const [currentProjectIndex, setCurrentProjectIndex] = useState(null);
+  // Removed unused currentProjectIndex state
   const [showProfile, setShowProfile] = useState(false);
   const [activityLog, setActivityLog] = useState([]);
   const [modals, setModals] = useState({
@@ -26,6 +26,8 @@ function App() {
   const [currentForecastData, setCurrentForecastData] = useState(null);
   const [loginError, setLoginError] = useState("");
   const [signupError, setSignupError] = useState("");
+  const [signupRole, setSignupRole] = useState("");
+  const [signupAdminLevel, setSignupAdminLevel] = useState("");
 
   // Load user session from localStorage on app startup
   useEffect(() => {
@@ -41,12 +43,7 @@ function App() {
     }
   }, []);
 
-  // Load projects when user logs in
-  useEffect(() => {
-    if (userData.id) {
-      loadUserProjects();
-    }
-  }, [userData.id]);
+  // Moved useEffect to after loadUserProjects definition
 
   // State mapping for admin oversight
   const stateMapping = {
@@ -86,17 +83,10 @@ function App() {
     return "Unknown";
   };
 
-  // Filter projects for admin based on their state
-  const getAdminProjects = () => {
-    if (userData.role !== "admin") return [];
-    return projects.filter((project) => {
-      const projectState = getUserState(project.location);
-      return projectState === userData.state;
-    });
-  };
+  // Removed unused getAdminProjects function
 
   // Load projects from database
-  const loadUserProjects = async () => {
+  const loadUserProjects = useCallback(async () => {
     if (!userData.id) {
       console.log("No user ID available, skipping project load");
       return;
@@ -104,7 +94,7 @@ function App() {
     
     try {
       console.log(`Loading projects for user ID: ${userData.id}`);
-      const response = await fetch(`http://localhost:5002/projects/${userData.id}`, {
+      const response = await fetch(`http://127.0.0.1:5002/projects/${userData.id}`, {
         method: "GET",
         headers: { "Content-Type": "application/json" },
       });
@@ -124,7 +114,14 @@ function App() {
       // Don't clear projects on error, keep existing ones
       return [];
     }
-  };
+  }, [userData.id]);
+
+  // Load projects when user logs in
+  useEffect(() => {
+    if (userData.id) {
+      loadUserProjects();
+    }
+  }, [userData.id]);
 
   // Project handlers
   const handleCreateProject = async (e) => {
@@ -144,7 +141,7 @@ function App() {
 
     try {
       // Create project via API (which includes prediction)
-      const response = await fetch("http://localhost:5002/projects", {
+      const response = await fetch("http://127.0.0.1:5002/projects", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(projectData),
@@ -201,25 +198,15 @@ function App() {
     }
   };
 
-  const handleOpenProjectDetails = (index) => {
-    setCurrentProjectIndex(index);
-    setModals({ ...modals, projectDetails: true });
-  };
+  // Removed unused handleOpenProjectDetails function
 
-  const handleDeleteProject = () => {
-    if (currentProjectIndex !== null) {
-      logActivity(`Deleted project for: ${projects[currentProjectIndex].location}`);
-      const updated = projects.filter((_, i) => i !== currentProjectIndex);
-      setProjects(updated);
-      setModals({ ...modals, projectDetails: false });
-      setCurrentProjectIndex(null);
-    }
-  };
+  // Removed unused handleDeleteProject function
 
   // Admin project management
+  // eslint-disable-next-line no-unused-vars
   const handleProjectAction = async (projectId, action) => {
     try {
-      const response = await fetch(`http://localhost:5002/projects/${projectId}/status`, {
+      const response = await fetch(`http://127.0.0.1:5002/projects/${projectId}/status`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ 
@@ -253,11 +240,12 @@ function App() {
       username: form.email.value, // Using email as username
       password: form.password.value,
       role: form.role.value,
-      state: form.state.value,
+      admin_level: signupAdminLevel || undefined,
+      state: form.state?.value || "",
     };
 
     try {
-      const response = await fetch("http://localhost:5002/auth/signup", {
+      const response = await fetch("http://127.0.0.1:5002/auth/signup", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(signupData),
@@ -303,7 +291,7 @@ function App() {
     };
 
     try {
-      const response = await fetch("http://localhost:5002/auth/login", {
+      const response = await fetch("http://127.0.0.1:5002/auth/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(loginData),
@@ -376,6 +364,7 @@ function App() {
     );
   };
 
+  // eslint-disable-next-line no-unused-vars
   const getStatusBadge = (status) => {
     const colors = {
       pending: "bg-yellow-100 text-yellow-800 ring-yellow-300/50",
@@ -525,7 +514,6 @@ function App() {
                   setShowProjects(false);
                   setShowAdminDashboard(false);
                   setActivityLog([]);
-                  setCurrentProjectIndex(null);
                   
                   // Clear localStorage
                   localStorage.removeItem('userData');
@@ -590,9 +578,9 @@ function App() {
           </aside>
         )}
 
-        {showAdminDashboard ? (
-          <AdminDashboard userData={userData} />
-        ) : showForecastResults ? (
+      {showAdminDashboard ? (
+        <AdminDashboard userData={userData} />
+      ) : showForecastResults ? (
           <main className="flex-1">
             <section className="mt-8 py-12 max-w-7xl mx-auto rounded-3xl shadow-2xl p-8 bg-white/80 backdrop-blur-xl ring-1 ring-gray-200/50 border border-white/20">
               {/* Header */}
@@ -688,6 +676,7 @@ function App() {
 
               {/* Action Buttons */}
               <div className="flex flex-col sm:flex-row gap-4 justify-center mt-12">
+                {( !(userData.role === 'admin' && (userData.admin_level || '').toLowerCase() === 'central') ) && (
                 <button
                   onClick={() => {
                     setShowForecastResults(false);
@@ -701,8 +690,13 @@ function App() {
                   </svg>
                   View All Projects
                 </button>
+                )}
                 <button
                   onClick={() => {
+                    if (userData.role === 'admin' && (userData.admin_level || '').toLowerCase() === 'central') {
+                      showCustomMessage('Central admins cannot create projects.');
+                      return;
+                    }
                     setShowForecastResults(false);
                     setCurrentForecastData(null);
                   }}
@@ -716,10 +710,10 @@ function App() {
               </div>
             </section>
           </main>
-        ) : showDashboard ? (
-          <Dashboard projects={projects} goBack={() => setShowDashboard(false)} />
-        ) : showProjects ? (
-          <Dashboard projects={projects} goBack={() => setShowProjects(false)} showAllProjects={true} onProjectUpdate={loadUserProjects} />
+      ) : showDashboard ? (
+        <Dashboard projects={projects} goBack={() => setShowDashboard(false)} userData={userData} />
+      ) : showProjects ? (
+        <Dashboard projects={projects} goBack={() => setShowProjects(false)} showAllProjects={true} onProjectUpdate={loadUserProjects} userData={userData} />
         ) : showProfile ? (
           <main className="flex-1">
             <section className="mt-8 py-12 max-w-7xl mx-auto rounded-3xl shadow-2xl p-8 bg-white/80 backdrop-blur-xl ring-1 ring-gray-200/50 border border-white/20">
@@ -933,11 +927,17 @@ function App() {
                 </p>
                 {userData.email && (
                   <div className="flex justify-center flex-wrap gap-6">
+                    {( !(userData.role === 'admin' && (userData.admin_level || '').toLowerCase() === 'central') ) && (
                     <button
                       className="group relative px-8 py-4 rounded-2xl bg-white border-2 border-gray-200 text-gray-900 font-bold shadow-lg hover:shadow-xl hover:border-emerald-300 transition-all duration-200 transform hover:-translate-y-1"
                       onClick={() => {
                         setShowForecastResults(false);
                         setCurrentForecastData(null);
+                        // allow only non-central users
+                        if (userData.role === 'admin' && (userData.admin_level || '').toLowerCase() === 'central') {
+                          showCustomMessage('Central admins cannot create projects.');
+                          return;
+                        }
                         setModals({ ...modals, project: true });
                       }}
                     >
@@ -948,6 +948,7 @@ function App() {
                         Create New Project
                       </span>
                     </button>
+                    )}
                     <button
                       className="px-8 py-4 rounded-2xl bg-gradient-to-r from-emerald-600 to-teal-600 text-white font-bold shadow-lg hover:shadow-xl hover:from-emerald-700 hover:to-teal-700 transition-all duration-200 transform hover:-translate-y-1 flex items-center gap-3"
                       onClick={() => {
@@ -1068,17 +1069,26 @@ function App() {
               <input name="fullname" placeholder="Full Name" className="w-full p-3 border rounded-xl" required />
               <input name="email" placeholder="Username" className="w-full p-3 border rounded-xl" required />
               <input name="password" type="password" placeholder="Password" className="w-full p-3 border rounded-xl" required />
-              <select name="role" className="w-full p-3 border rounded-xl" required>
+              <select name="role" className="w-full p-3 border rounded-xl" required onChange={(e)=>{ setSignupRole(e.target.value); setSignupAdminLevel(""); }}>
                 <option value="">Select Role</option>
                 <option value="admin">Admin</option>
                 <option value="employee">Employee</option>
               </select>
-              <select name="state" className="w-full p-3 border rounded-xl" required>
+              {signupRole === 'admin' && (
+                <select name="admin_level" className="w-full p-3 border rounded-xl" required onChange={(e)=> setSignupAdminLevel(e.target.value)}>
+                  <option value="">Admin Type</option>
+                  <option value="state">State Admin</option>
+                  <option value="central">Central Admin</option>
+                </select>
+              )}
+              {(signupRole === 'employee' || (signupRole === 'admin' && signupAdminLevel === 'state')) && (
+                <select name="state" className="w-full p-3 border rounded-xl" required>
                 <option value="">Select State</option>
                 {Object.keys(stateMapping).map((state) => (
                   <option key={state} value={state}>{state}</option>
                 ))}
               </select>
+              )}
               {signupError && (
                 <div className="text-red-600 text-sm">{signupError}</div>
               )}

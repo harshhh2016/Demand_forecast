@@ -12,7 +12,7 @@ const AdminDashboard = ({ userData }) => {
     
     try {
       setLoading(true);
-      const response = await fetch(`http://localhost:5002/projects/pending/${userData.state}`);
+      const response = await fetch(`http://127.0.0.1:5002/projects/pending/${userData.state}`);
       const data = await response.json();
       
       if (response.ok) {
@@ -32,7 +32,7 @@ const AdminDashboard = ({ userData }) => {
     
     try {
       setLoading(true);
-      const response = await fetch(`http://localhost:5002/projects/all/${userData.state}`);
+      const response = await fetch(`http://127.0.0.1:5002/projects/all/${userData.state}`);
       const data = await response.json();
       
       if (response.ok) {
@@ -72,7 +72,7 @@ const AdminDashboard = ({ userData }) => {
       const notes = approvalNotes[projectId] || '';
       const endpoint = action === 'approve' ? 'approve' : 'reject';
       
-      const response = await fetch(`http://localhost:5002/projects/${projectId}/${endpoint}`, {
+      const response = await fetch(`http://127.0.0.1:5002/projects/${projectId}/${endpoint}`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

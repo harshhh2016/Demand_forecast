@@ -11,7 +11,10 @@ export default function ReorderAlerts({ projectId }) {
       try {
         setLoading(true);
         setError('');
-        const resp = await fetch(`http://localhost:5002/api/inventory/alerts/${projectId}`);
+        const params = new URLSearchParams();
+        if (projectId) params.set('project_id', String(projectId));
+        const qs = params.toString() ? `?${params.toString()}` : '';
+        const resp = await fetch(`http://127.0.0.1:5002/inventory/alerts${qs}`);
         if (!resp.ok) throw new Error('Failed to fetch alerts');
         const data = await resp.json();
         if (!cancelled) setAlerts(data);
@@ -37,16 +40,20 @@ export default function ReorderAlerts({ projectId }) {
             <thead>
               <tr className="text-left text-red-800">
                 <th className="py-2 pr-4">Material</th>
-                <th className="py-2 pr-4">Current Qty (MT)</th>
-                <th className="py-2 pr-4">Reorder Point (MT)</th>
+                <th className="py-2 pr-4">Current Qty</th>
+                <th className="py-2 pr-4">Threshold</th>
+                <th className="py-2 pr-4">Suggested Order</th>
+                <th className="py-2 pr-4">Priority</th>
               </tr>
             </thead>
             <tbody>
               {alerts.map((a, idx) => (
                 <tr key={idx} className="bg-red-100/60">
-                  <td className="py-2 pr-4 font-semibold">{a.material_name}</td>
-                  <td className="py-2 pr-4">{Math.ceil(a.current_quantity_mt)}</td>
+                  <td className="py-2 pr-4 font-semibold">{a.material_name} ({a.unit})</td>
+                  <td className="py-2 pr-4">{Math.ceil(a.current_stock)}</td>
                   <td className="py-2 pr-4 font-semibold text-red-700">{Math.ceil(a.reorder_point)}</td>
+                  <td className="py-2 pr-4 font-semibold text-blue-700">{Math.ceil(a.suggested_order_quantity || 0)} {a.unit}</td>
+                  <td className="py-2 pr-4">{a.priority}</td>
                 </tr>
               ))}
             </tbody>

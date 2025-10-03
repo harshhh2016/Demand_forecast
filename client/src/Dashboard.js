@@ -1,8 +1,18 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
+import ProjectInventory from './ProjectInventory';
 
-const Dashboard = ({ projects, goBack, showAllProjects = false, onProjectUpdate }) => {
+// Shared helpers
+const formatQuantity = (value) => {
+  const num = Math.ceil(Number(value) || 0);
+  return num.toLocaleString();
+};
+
+// Removed currency formatting from inventory views per requirement
+
+const Dashboard = ({ projects, goBack, showAllProjects = false, onProjectUpdate, userData }) => {
   const [selectedProject, setSelectedProject] = useState(null);
   const [showProjectModal, setShowProjectModal] = useState(false);
+  const [showProjectInventory, setShowProjectInventory] = useState(false);
 
   const openProjectDetails = (project) => {
     setSelectedProject(project);
@@ -14,12 +24,35 @@ const Dashboard = ({ projects, goBack, showAllProjects = false, onProjectUpdate 
     setShowProjectModal(false);
   };
 
+  const openProjectInventory = (project) => {
+    setSelectedProject(project);
+    setShowProjectInventory(true);
+  };
+
+  const closeProjectInventory = () => {
+    setSelectedProject(null);
+    setShowProjectInventory(false);
+  };
+
+  // When inventory view is active, show it as the primary content
+  if (showProjectInventory && selectedProject) {
+    return (
+      <main className="flex-1">
+        <ProjectInventory
+          project={selectedProject}
+          userData={userData}
+          goBack={closeProjectInventory}
+        />
+      </main>
+    );
+  }
+
   const handleProjectAction = async (projectId, action) => {
     try {
       const endpoint = action === 'finished' ? 'finish' : 'delete';
       const method = action === 'delete' ? 'DELETE' : 'PUT';
       
-      const response = await fetch(`http://localhost:5002/projects/${projectId}/${endpoint}`, {
+      const response = await fetch(`http://127.0.0.1:5002/projects/${projectId}/${endpoint}`, {
         method: method,
         headers: {
           'Content-Type': 'application/json',
@@ -52,6 +85,7 @@ const Dashboard = ({ projects, goBack, showAllProjects = false, onProjectUpdate 
       minute: '2-digit'
     });
   };
+
   return (
     <main className="flex-1">
       <section className="relative rounded-3xl p-8 shadow-2xl bg-white/80 backdrop-blur-xl ring-1 ring-gray-200/50 h-full">
@@ -192,10 +226,20 @@ const Dashboard = ({ projects, goBack, showAllProjects = false, onProjectUpdate 
                     </div>
                     <div>
                       <h5 className="font-semibold text-gray-900">{project.location}</h5>
-                      <p className="text-sm text-gray-500">Budget: {project.budget}</p>
+                      {/* Removed budget currency display per requirement */}
                     </div>
                   </div>
                   <div className="flex items-center gap-3">
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        openProjectInventory(project);
+                      }}
+                      className="px-3 py-1 bg-blue-500 text-white text-xs font-semibold rounded-full hover:bg-blue-600 transition-colors"
+                      title="Manage Inventory"
+                    >
+                      Inventory
+                    </button>
                     <span className={`px-3 py-1 rounded-full text-xs font-semibold ${
                       project.status === 'approved' ? 'bg-green-100 text-green-800' :
                       project.status === 'pending' ? 'bg-yellow-100 text-yellow-800' :
@@ -246,10 +290,7 @@ const Dashboard = ({ projects, goBack, showAllProjects = false, onProjectUpdate 
               {/* Row 1: Budget & Location */}
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-2">Budget (INR)</label>
-                  <div className="w-full p-3 border rounded-xl bg-gray-50 text-gray-900 font-medium">
-                    {selectedProject.budget}
-                  </div>
+                  {/* Removed budget display */}
                 </div>
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-2">Project Location</label>
@@ -315,6 +356,9 @@ const Dashboard = ({ projects, goBack, showAllProjects = false, onProjectUpdate 
                 </div>
               </div>
             </div>
+
+            {/* Material Usage History */}
+            <MaterialUsageHistory projectId={selectedProject.id} />
 
             {/* Demand Forecasts */}
             {(selectedProject.steel_forecast !== undefined || selectedProject.conductor_forecast !== undefined || selectedProject.transformers_forecast !== undefined || selectedProject.earthwire_forecast !== undefined || selectedProject.foundation_forecast !== undefined || selectedProject.reactors_forecast !== undefined || selectedProject.tower_forecast !== undefined) && (
@@ -410,7 +454,138 @@ const Dashboard = ({ projects, goBack, showAllProjects = false, onProjectUpdate 
           </div>
         </div>
       )}
+
+      {/* Project Inventory View */}
+      {showProjectInventory && selectedProject && (
+        <ProjectInventory
+          project={selectedProject}
+          userData={userData}
+          goBack={closeProjectInventory}
+        />
+      )}
     </main>
+  );
+};
+
+// Material Usage History Component
+const MaterialUsageHistory = ({ projectId }) => {
+  const [usageHistory, setUsageHistory] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  const loadUsageHistory = useCallback(async () => {
+    try {
+      const response = await fetch(`http://127.0.0.1:5002/inventory/project-usage/${projectId}`);
+      if (response.ok) {
+        const data = await response.json();
+        setUsageHistory(Array.isArray(data) ? data : []);
+      } else {
+        setUsageHistory([]);
+      }
+    } catch (error) {
+      console.error('Error loading usage history:', error);
+      setUsageHistory([]);
+    } finally {
+      setLoading(false);
+    }
+  }, [projectId]);
+
+  useEffect(() => {
+    if (projectId) {
+      loadUsageHistory();
+    }
+  }, [projectId, loadUsageHistory]);
+
+  const formatDate = (dateString) => {
+    return new Date(dateString).toLocaleDateString('en-US', {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit'
+    });
+  };
+
+  const formatCurrency = (amount) => {
+    return new Intl.NumberFormat('en-IN', { 
+      style: 'currency', 
+      currency: 'INR',
+      minimumFractionDigits: 0,
+      maximumFractionDigits: 0
+    }).format(Math.ceil(Number(amount) || 0));
+  };
+
+  if (loading) {
+    return (
+      <div className="bg-gray-50 rounded-2xl p-6 mb-6">
+        <h5 className="text-lg font-semibold text-gray-900 mb-4">Material Usage History</h5>
+        <div className="animate-pulse">
+          <div className="h-4 bg-gray-200 rounded w-1/4 mb-3"></div>
+          <div className="h-4 bg-gray-200 rounded w-1/2"></div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="bg-gray-50 rounded-2xl p-6 mb-6">
+      <h5 className="text-lg font-semibold text-gray-900 mb-4 flex items-center gap-2">
+        <svg className="h-5 w-5 text-orange-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v10a2 2 0 002 2h8a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" />
+        </svg>
+        Material Usage History
+      </h5>
+      
+      {usageHistory.length === 0 ? (
+        <p className="text-gray-500 text-center py-4">No material usage recorded yet</p>
+      ) : (
+        <div className="space-y-3">
+          {usageHistory.map((usage) => (
+            <div key={usage.id} className="bg-white rounded-lg p-4 border border-gray-200">
+              <div className="flex items-center justify-between mb-2">
+                <div className="flex items-center gap-3">
+                  <span className={`px-2 py-1 rounded text-xs font-medium ${
+                    usage.quantity_used < 0 ? 'bg-blue-100 text-blue-800' : 'bg-red-100 text-red-800'
+                  }`}>
+                    {usage.quantity_used < 0 ? 'RESERVED' : 'USED'}
+                  </span>
+                  <h6 className="font-semibold text-gray-900">{usage.material_name}</h6>
+                  <span className="text-sm text-gray-500">({usage.category})</span>
+                </div>
+                <div className="text-right">
+                  <p className="font-semibold text-gray-900">
+                    {formatQuantity(Math.abs(usage.quantity_used))} {usage.unit}
+                  </p>
+                  {/* Removed cost display */}
+                </div>
+              </div>
+              
+              <div className="flex items-center justify-between text-sm text-gray-500">
+                <span>By: {usage.logged_by}</span>
+                <span>{formatDate(usage.usage_date)}</span>
+              </div>
+              
+              {usage.notes && (
+                <div className="mt-2 p-2 bg-gray-50 rounded text-sm text-gray-600">
+                  <strong>Notes:</strong> {usage.notes}
+                </div>
+              )}
+            </div>
+          ))}
+          
+          {/* Summary */}
+          <div className="bg-white rounded-lg p-4 border-2 border-blue-200 mt-4">
+            <h6 className="font-semibold text-gray-900 mb-2">Summary</h6>
+            <div className="grid grid-cols-2 gap-4 text-sm">
+              <div>
+                <p className="text-gray-600">Total Entries:</p>
+                <p className="font-semibold">{usageHistory.length}</p>
+              </div>
+              {/* Removed total cost summary */}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
   );
 };
 

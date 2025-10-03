@@ -102,7 +102,7 @@ function App() {
     
     try {
       console.log(`Loading projects for user ID: ${userData.id}`);
-      const response = await fetch(`http://localhost:5002/projects/${userData.id}`, {
+      const response = await fetch(`http://127.0.0.1:5002/projects/${userData.id}`, {
         method: "GET",
         headers: { "Content-Type": "application/json" },
       });
@@ -139,7 +139,7 @@ function App() {
 
     try {
       // Create project via API (which includes prediction)
-      const response = await fetch("http://localhost:5002/projects", {
+      const response = await fetch("http://127.0.0.1:5002/projects", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(projectData),
@@ -187,7 +187,7 @@ function App() {
   // Admin project management
   const handleProjectAction = async (projectId, action) => {
     try {
-      const response = await fetch(`http://localhost:5002/projects/${projectId}/status`, {
+      const response = await fetch(`http://127.0.0.1:5002/projects/${projectId}/status`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ 
@@ -223,7 +223,7 @@ function App() {
     };
 
     try {
-      const response = await fetch("http://localhost:5002/auth/signup", {
+      const response = await fetch("http://127.0.0.1:5002/auth/signup", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(signupData),
@@ -269,7 +269,7 @@ function App() {
     };
 
     try {
-      const response = await fetch("http://localhost:5002/auth/login", {
+      const response = await fetch("http://127.0.0.1:5002/auth/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(loginData),
